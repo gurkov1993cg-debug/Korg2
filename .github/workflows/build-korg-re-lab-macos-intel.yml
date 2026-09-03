@@ -1,0 +1,123 @@
+name: Build KORG RE LAB macOS Intel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'KORG-RE-LAB-source.zip'
+      - '.github/workflows/build-korg-re-lab-macos-intel.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'KORG-RE-LAB-source.zip'
+      - '.github/workflows/build-korg-re-lab-macos-intel.yml'
+
+concurrency:
+  group: korg-re-lab-macos-intel
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Expand source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP='KORG-RE-LAB-source.zip'
+          test -f "$ZIP" || { echo 'KORG RE LAB source ZIP not found'; exit 1; }
+          rm -rf korg-re-lab-src
+          mkdir -p korg-re-lab-src
+          ditto -x -k "$ZIP" korg-re-lab-src
+          CMAKE_FILE=$(find korg-re-lab-src -maxdepth 4 -name CMakeLists.txt -print -quit)
+          test -n "$CMAKE_FILE" || { echo 'CMakeLists.txt not found in source ZIP'; exit 1; }
+          ROOT=$(dirname "$CMAKE_FILE")
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+      - name: Configure Intel macOS 10.13
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$PROJECT_ROOT" -B build -G Xcode \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON
+
+      - name: Build KORG RE LAB
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --config Release --parallel 4
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -C Release --output-on-failure | tee test-results.txt
+
+      - name: Locate executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=$(find build -type f -name 'korg-re-lab' -perm +111 -print -quit)
+          test -n "$BIN" || { echo 'korg-re-lab executable not found'; exit 1; }
+          echo "KORG_RE_LAB_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "Executable: $BIN"
+
+      - name: Verify Intel and macOS 10.13 target
+        shell: bash
+        run: |
+          set -euo pipefail
+          file "$KORG_RE_LAB_BIN" | tee binary-info.txt
+          file "$KORG_RE_LAB_BIN" | grep -q 'x86_64' || { echo 'ERROR: binary is not x86_64'; exit 1; }
+
+          VTOOL_OUTPUT=$(xcrun vtool -show-build "$KORG_RE_LAB_BIN")
+          printf '%s\n' "$VTOOL_OUTPUT" | tee deployment-info.txt
+          MINOS=$(printf '%s\n' "$VTOOL_OUTPUT" | awk '
+            $1 == "minos" { print $2; exit }
+            /LC_VERSION_MIN_MACOSX/ { legacy=1; next }
+            legacy && $1 == "version" { print $2; exit }
+          ')
+          test -n "$MINOS" || { echo 'Could not determine deployment target'; exit 1; }
+          awk -v v="$MINOS" 'BEGIN {
+            split(v, a, "."); major=a[1]+0; minor=a[2]+0;
+            if (major > 10 || (major == 10 && minor > 13)) exit 1;
+          }' || { echo "ERROR: deployment target $MINOS is newer than macOS 10.13"; exit 1; }
+
+      - name: Smoke test executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$KORG_RE_LAB_BIN" --help > cli-help.txt 2>&1 || true
+          cat cli-help.txt
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifact
+          mkdir -p artifact/KORG-RE-LAB-macOS-Intel
+          cp "$KORG_RE_LAB_BIN" artifact/KORG-RE-LAB-macOS-Intel/
+          cp "$PROJECT_ROOT/README.md" artifact/KORG-RE-LAB-macOS-Intel/
+          cp binary-info.txt deployment-info.txt test-results.txt cli-help.txt artifact/KORG-RE-LAB-macOS-Intel/
+          ditto -c -k --sequesterRsrc --keepParent \
+            artifact/KORG-RE-LAB-macOS-Intel \
+            KORG-RE-LAB-macOS-Intel.zip
+
+      - name: Upload Intel macOS build
+        uses: actions/upload-artifact@v4
+        with:
+          name: KORG-RE-LAB-macOS-Intel
+          path: KORG-RE-LAB-macOS-Intel.zip
+          if-no-files-found: error
+          retention-days: 30
