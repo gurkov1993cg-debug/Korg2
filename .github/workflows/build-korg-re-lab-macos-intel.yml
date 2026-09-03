@@ -50,10 +50,9 @@ jobs:
           cmake -S "$PROJECT_ROOT" -B build -G Xcode \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=ON
 
-      - name: Build KORG RE LAB
+      - name: Build KORG RE LAB app
         shell: bash
         run: |
           set -euo pipefail
@@ -65,13 +64,23 @@ jobs:
           set -euo pipefail
           ctest --test-dir build -C Release --output-on-failure | tee test-results.txt
 
-      - name: Locate executable
+      - name: Locate macOS app
         shell: bash
         run: |
           set -euo pipefail
-          BIN=$(find build -type f -name 'korg-re-lab' -perm +111 -print -quit)
-          test -n "$BIN" || { echo 'korg-re-lab executable not found'; exit 1; }
+          APP=$(find build -type d -name 'KORG RE LAB.app' -print -quit)
+          test -n "$APP" || { echo 'KORG RE LAB.app not found'; find build -maxdepth 4 -print; exit 1; }
+
+          BIN="$APP/Contents/MacOS/KORG RE LAB"
+          test -x "$BIN" || { echo "App executable not found: $BIN"; find "$APP" -maxdepth 4 -print; exit 1; }
+
+          PLIST="$APP/Contents/Info.plist"
+          test -f "$PLIST" || { echo "Info.plist not found"; exit 1; }
+          plutil -lint "$PLIST"
+
+          echo "KORG_RE_LAB_APP=$APP" >> "$GITHUB_ENV"
           echo "KORG_RE_LAB_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "App: $APP"
           echo "Executable: $BIN"
 
       - name: Verify Intel and macOS 10.13 target
@@ -83,41 +92,52 @@ jobs:
 
           VTOOL_OUTPUT=$(xcrun vtool -show-build "$KORG_RE_LAB_BIN")
           printf '%s\n' "$VTOOL_OUTPUT" | tee deployment-info.txt
+
           MINOS=$(printf '%s\n' "$VTOOL_OUTPUT" | awk '
             $1 == "minos" { print $2; exit }
             /LC_VERSION_MIN_MACOSX/ { legacy=1; next }
             legacy && $1 == "version" { print $2; exit }
           ')
           test -n "$MINOS" || { echo 'Could not determine deployment target'; exit 1; }
+
           awk -v v="$MINOS" 'BEGIN {
             split(v, a, "."); major=a[1]+0; minor=a[2]+0;
             if (major > 10 || (major == 10 && minor > 13)) exit 1;
           }' || { echo "ERROR: deployment target $MINOS is newer than macOS 10.13"; exit 1; }
 
-      - name: Smoke test executable
+      - name: Validate app bundle
         shell: bash
         run: |
           set -euo pipefail
-          "$KORG_RE_LAB_BIN" --help > cli-help.txt 2>&1 || true
-          cat cli-help.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$KORG_RE_LAB_APP/Contents/Info.plist" | tee app-info.txt
+          grep -qx 'KORG RE LAB' app-info.txt || { echo 'CFBundleExecutable does not match app binary'; exit 1; }
+
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KORG_RE_LAB_APP/Contents/Info.plist" | tee -a app-info.txt
+
+          codesign --force --deep --sign - "$KORG_RE_LAB_APP"
+          codesign --verify --deep --strict "$KORG_RE_LAB_APP"
 
       - name: Collect artifact
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf artifact
-          mkdir -p artifact/KORG-RE-LAB-macOS-Intel
-          cp "$KORG_RE_LAB_BIN" artifact/KORG-RE-LAB-macOS-Intel/
-          cp "$PROJECT_ROOT/README.md" artifact/KORG-RE-LAB-macOS-Intel/
-          cp binary-info.txt deployment-info.txt test-results.txt cli-help.txt artifact/KORG-RE-LAB-macOS-Intel/
+          rm -f KORG-RE-LAB-macOS-Intel.zip
+
           ditto -c -k --sequesterRsrc --keepParent \
-            artifact/KORG-RE-LAB-macOS-Intel \
+            "$KORG_RE_LAB_APP" \
             KORG-RE-LAB-macOS-Intel.zip
 
-      - name: Upload Intel macOS build
+          test -s KORG-RE-LAB-macOS-Intel.zip || { echo 'Artifact ZIP was not created'; exit 1; }
+
+      - name: Upload Intel macOS app
         uses: actions/upload-artifact@v4
         with:
           name: KORG-RE-LAB-macOS-Intel
-          path: KORG-RE-LAB-macOS-Intel.zip
+          path: |
+            KORG-RE-LAB-macOS-Intel.zip
+            binary-info.txt
+            deployment-info.txt
+            test-results.txt
+            app-info.txt
           if-no-files-found: error
           retention-days: 30
